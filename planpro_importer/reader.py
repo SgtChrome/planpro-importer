@@ -1,32 +1,120 @@
-from yaramo.model import Topology, Node, Signal, Edge, DbrefGeoNode, Route
+from yaramo.model import Topology, Node, Signal, Edge, DbrefGeoNode, Route, ElevationSegment, ElevationPoint, VacancySection, TrackSection, VacancyComponent, Balise, Datapoint, BaliseGroup
 from planpro_importer import model
-
+import os
 
 class PlanProReader(object):
 
     def __init__(self, plan_pro_file_name):
-        if not plan_pro_file_name.endswith(".ppxml"):
-            plan_pro_file_name = plan_pro_file_name + ".ppxml"
         self.plan_pro_file_name = plan_pro_file_name
-        self.topology = Topology(name=self.plan_pro_file_name.split("/")[-1][:-6])
+        self.topology = Topology(name=os.path.basename(os.path.splitext(self.plan_pro_file_name)[0]))
 
     def read_topology_from_plan_pro_file(self):
         root_object = model.parse(self.plan_pro_file_name, silence=True)
-        number_of_fachdaten = len(root_object.LST_Planung.Fachdaten.Ausgabe_Fachdaten)
 
-        for id_of_fachdaten in range(0, number_of_fachdaten):
-            container = root_object.LST_Planung.Fachdaten.Ausgabe_Fachdaten[id_of_fachdaten].LST_Zustand_Ziel.Container
-            self.read_topology_from_container(container)
+        # check where in the root_object is the container
+        # this handles only the two so far encountered edge cases
+        if hasattr(root_object, "LST_Planung"):
+            if hasattr(root_object.LST_Planung, "Fachdaten"):
+                number_of_fachdaten = len(root_object.LST_Planung.Fachdaten.Ausgabe_Fachdaten)
+                for id_of_fachdaten in range(0, number_of_fachdaten):
+                    container = root_object.LST_Planung.Fachdaten.Ausgabe_Fachdaten[id_of_fachdaten].LST_Zustand_Ziel.Container
+                    self.read_topology_from_container(container)
+                    self.read_routes_from_container(container)
+                    self.read_elevation_profile_from_container(container)
+                    self.read_datapoints_from_container(container)
+                    self.read_vacancy_sections_from_container(container)
 
-        for id_of_fachdaten in range(0, number_of_fachdaten):
-            container = root_object.LST_Planung.Fachdaten.Ausgabe_Fachdaten[id_of_fachdaten].LST_Zustand_Ziel.Container
-            self.read_signals_from_container(container)
+                # second iteration because some elements contain the objects of the first iteration for convenience
+                # to avoid a new lookup in the topology dictionaries when exporting
+                for id_of_fachdaten in range(0, number_of_fachdaten):
+                    container = root_object.LST_Planung.Fachdaten.Ausgabe_Fachdaten[id_of_fachdaten].LST_Zustand_Ziel.Container
+                    self.read_signals_from_container(container)
+                    self.read_balises_from_container(container)
+                    self.group_balises_into_balise_groups()
 
-        for id_of_fachdaten in range(0, number_of_fachdaten):
-            container = root_object.LST_Planung.Fachdaten.Ausgabe_Fachdaten[id_of_fachdaten].LST_Zustand_Ziel.Container
-            self.read_routes_from_container(container)
+                return self.topology
 
-        return self.topology
+        if hasattr(root_object, "LST_Zustand"):
+            if hasattr(root_object.LST_Zustand, "Container"):
+                container = root_object.LST_Zustand.Container
+                self.read_topology_from_container(container)
+                self.read_signals_from_container(container)
+                self.read_routes_from_container(container)
+                self.read_elevation_profile_from_container(container)
+
+                return self.topology
+
+    def read_elevation_profile_from_container(self, container):
+        # Höhenpunkte
+        for hoehenpunkt in container.Hoehenpunkt:
+            hoehenpunkt_uuid = hoehenpunkt.Identitaet.Wert
+            if hasattr(hoehenpunkt, "Punkt_Objekt_TOP_Kante"):
+                if hasattr(hoehenpunkt.Punkt_Objekt_TOP_Kante, "Seitlicher_Abstand"):
+                    if hoehenpunkt.Punkt_Objekt_TOP_Kante[0].Seitlicher_Abstand.Wert != 0:
+                        print("Seitlicher Abstand nicht implementiert")
+            hoehenpunkt_obj = ElevationPoint(
+                uuid=hoehenpunkt_uuid,
+                edge_uuid=hoehenpunkt.Punkt_Objekt_TOP_Kante[0].ID_TOP_Kante.Wert,
+                offset=hoehenpunkt.Punkt_Objekt_TOP_Kante[0].Abstand.Wert,
+                angle=hoehenpunkt.Hoehenpunkt_Allg.Neigung.Wert if hasattr(hoehenpunkt.Hoehenpunkt_Allg, "Neigung") and hoehenpunkt.Hoehenpunkt_Allg.Neigung is not None else None,
+                height=hoehenpunkt.Hoehenpunkt_Allg.Hoehenpunkt_Hoehe.Wert if hasattr(hoehenpunkt.Hoehenpunkt_Allg, "Hoehenpunkt_Hoehe") and hoehenpunkt.Hoehenpunkt_Allg.Hoehenpunkt_Hoehe is not None else None)
+
+            self.topology.add_elevation_point(hoehenpunkt_obj)
+
+        # Höhenlinien
+        for hoehenlinie in container.Hoehenlinie:
+            hoehenlinie_uuid = hoehenlinie.Identitaet.Wert
+            elevation_point_a = self.topology.elevation_points[hoehenlinie.ID_Hoehenpunkt_A.Wert]
+            elevation_point_b = self.topology.elevation_points[hoehenlinie.ID_Hoehenpunkt_B.Wert]
+            hoehenlinie_obj = ElevationSegment(
+                uuid=hoehenlinie_uuid,
+                elevation_point_a=elevation_point_a,
+                elevation_point_b=elevation_point_b,
+                length=hoehenlinie.Hoehenlinie_Allg.Hoehenlinie_Laenge.Wert)
+
+            self.topology.add_elevation_segment(hoehenlinie_obj)
+
+    def read_datapoints_from_container(self, container):
+        # Datenpunkte
+        for datenpunkt in container.Datenpunkt:
+            datenpunkt_uuid = datenpunkt.Identitaet.Wert
+            etcs_address = {
+                "Kennung": datenpunkt.DP_ETCS_Adresse.ETCS_Adresse_Kennung.Wert,
+                "NID_C": datenpunkt.DP_ETCS_Adresse.ETCS_Adresse_NID_C.Wert,
+                "NID_BG": datenpunkt.DP_ETCS_Adresse.ETCS_Adresse_NID_BG.Wert,
+            }
+            datapoint_types = [x.Wert for x in datenpunkt.DP_Typ[0].DP_Typ_GETCS.DP_Typ_ETCS]
+            datapoint_obj = Datapoint(
+                uuid=datenpunkt_uuid,
+                edge=datenpunkt.Punkt_Objekt_TOP_Kante[0].ID_TOP_Kante.Wert,
+                offset=datenpunkt.Punkt_Objekt_TOP_Kante[0].Abstand.Wert,
+                etcs_level=datenpunkt.Datenpunkt_Allg.Anwendungssystem.Wert,
+                length=datenpunkt.Datenpunkt_Allg.Datenpunkt_Laenge.Wert,
+                # Ausrichtung as string is turned into a direction enum in the init method of Datapoint
+                direction=datenpunkt.Datenpunkt_Allg.Ausrichtung.Wert,
+                datapoint_types=datapoint_types,
+                etcs_address=etcs_address)
+
+            self.topology.add_datapoint(datapoint_obj)
+
+    def read_balises_from_container(self, container):
+        # Balisen
+        for balise in container.Balise:
+            balise_uuid = balise.Identitaet.Wert
+            balise_obj = Balise(
+                uuid=balise_uuid,
+                index=balise.Balise_Allg.Anordnung_Im_DP.Wert,
+                datapoint=self.topology.datapoints[balise.ID_Datenpunkt.Wert])
+            self.topology.add_balise(balise_obj)
+
+    def group_balises_into_balise_groups(self):
+        # Balise groups
+        # collects all balises with the same datapoint uuid into a BaliseGroup
+        for balise in self.topology.balises.values():
+            if balise.datapoint.uuid not in self.topology.balise_groups:
+                self.topology.add_balise_group(balise.datapoint.uuid, BaliseGroup([balise]))
+            else:
+                self.topology.balise_groups[balise.datapoint.uuid].add_balise(balise)
 
     def read_topology_from_container(self, container):
         for top_knoten in container.TOP_Knoten:
@@ -164,6 +252,48 @@ class PlanProReader(object):
             route.end_signal = end_signal
             route.edges = edges
             self.topology.add_route(route)
+
+    def read_vacancy_sections_from_container(self, container):
+        # Freimeldekomponenten (Achszähler)
+        for fma_komponente in container.FMA_Komponente:
+            self.topology.add_vacancy_element(
+                VacancyComponent(
+                    uuid=fma_komponente.Identitaet.Wert,
+                    vacancy_section_a_uuid=fma_komponente.ID_FMAgrenze[0].Wert if len(fma_komponente.ID_FMAgrenze) > 0 else None,
+                    vacancy_section_b_uuid=fma_komponente.ID_FMAgrenze[1].Wert if len(fma_komponente.ID_FMAgrenze) > 1 else None,
+                    edge_uuid=fma_komponente.Punkt_Objekt_TOP_Kante[0].ID_TOP_Kante.Wert,
+                    offset=fma_komponente.Punkt_Objekt_TOP_Kante[0].Abstand.Wert
+                )
+            )
+
+        # TrackSection and VacancySection are basically the same, but they both exist to
+        # imitate the PlanPro structure
+        # The track sections are stored inside the VacancySections in their class porperty
+
+        track_sections = {}
+        for gleis_abschnitt in container.Gleis_Abschnitt:
+            trackSection = TrackSection(
+                uuid=gleis_abschnitt.Identitaet.Wert,
+            )
+
+            # TODO Bereich_Objekt_Teilbereich can have more than 1 element
+            # for the purpose of lining up the vacancy section, presumably only the first element is needed
+            # since the end of the previous vacancy section coincides with the start of the next one
+
+            for sub_section in gleis_abschnitt.Bereich_Objekt_Teilbereich:
+                # SubSection element is constructed inside the add_sub_section method and added to the TrackSection
+                trackSection.add_subsection(offset_a=sub_section.Begrenzung_A.Wert,
+                                            offset_b=sub_section.Begrenzung_B.Wert,
+                                            edge_uuid=sub_section.ID_TOP_Kante.Wert)
+
+            track_sections[gleis_abschnitt.Identitaet.Wert] = trackSection
+
+        for fma_anlage in container.FMA_Anlage:
+            self.topology.add_vacancy_section(
+                VacancySection(
+                    uuid=fma_anlage.Identitaet.Wert,
+                    track_section=track_sections[fma_anlage.ID_Gleis_Abschnitt.Wert]
+                ))
 
     def get_coordinates_of_geo_node(self, container, uuid):
         geo_points = container.GEO_Punkt
